@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PubMed search exports (regenerable from the query; only the curated input set
+# data/csv-ultrasound-set.csv is tracked)
+pubmed_search.csv
+data/search_*.csv
