@@ -87,18 +87,30 @@ def curl_pdf(url: str, referer: str | None = None, timeout: int = 120,
 
 
 def fetch_pdf(url: str, referer: str | None, browser, timeout_ms: int = 120_000,
-              browser_fallback: bool = True, proxy: str | None = None) -> bytes | None:
-    data = curl_pdf(url, referer=referer, timeout=min(240, max(30, timeout_ms // 1000)),
-                    proxy=proxy)
-    if data:
-        return data
+              browser_fallback: bool = True, proxy: str | None = None,
+              curl_first: bool = True) -> bytes | None:
+    """Fetch a PDF, cheapest path first.
+
+    `curl_first=False` is for links found on an article page: those sites sit
+    behind a JS challenge, so bare curl has no cookies and would just stall for
+    its full timeout. Going to the browser session first is both faster and the
+    only path that actually carries entitlement cookies.
+    """
+    def _curl():
+        return curl_pdf(url, referer=referer, timeout=min(240, max(30, timeout_ms // 1000)),
+                        proxy=proxy)
+
+    if curl_first:
+        data = _curl()
+        if data:
+            return data
     if proxy or not browser_fallback or browser is None:
-        return None
+        return _curl() if not curl_first else None
     try:
         resp = browser.context.request.get(
             url,
             headers={"Accept": "application/pdf,*/*", "Referer": referer or url},
-            timeout=min(timeout_ms, 90_000),
+            timeout=min(timeout_ms, 60_000),
             max_redirects=10,
         )
         body = resp.body()
@@ -106,6 +118,10 @@ def fetch_pdf(url: str, referer: str | None, browser, timeout_ms: int = 120_000,
             return body
     except Exception:
         pass
+    if not curl_first:
+        data = _curl()
+        if data:
+            return data
     try:
         return browser.download_bytes(url, referer=referer)
     except Exception:

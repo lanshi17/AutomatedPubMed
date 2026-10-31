@@ -73,6 +73,9 @@ PAYWALL_MARKERS = ("get access", "buy article", "purchase pdf", "rent this artic
                    "buy now", "subscribe to", "sign in to download", "access options",
                    "purchase article")
 
+# Hosts that only mirror/redirect landing pages and never serve the PDF.
+DEAD_HOSTS = ("cnpereading.com", "oce.ovid.com", "kglmeridian.com", "yiigle.com")
+
 
 @dataclass
 class PdfResult:
@@ -163,11 +166,34 @@ def _host(url: str) -> str:
 
 
 class Resolver:
-    def __init__(self, browser: Browser, wall_wait_s: float = 8.0, timeout_ms: int = 120_000):
+    def __init__(self, browser: Browser, wall_wait_s: float = 20.0, timeout_ms: int = 120_000,
+                 wall_cooldown_s: float = 600.0):
         self.browser = browser
         self.wall_wait_s = wall_wait_s
         self.timeout_ms = timeout_ms
-        self.walled: dict[str, int] = {}
+        self.wall_cooldown_s = wall_cooldown_s
+        # prefix -> [consecutive_walls, cooldown_until_ts]
+        self.walled: dict[str, list[float]] = {}
+
+    def _wall_state(self, prefix: str) -> list[float]:
+        return self.walled.setdefault(prefix, [0.0, 0.0])
+
+    def _in_cooldown(self, prefix: str) -> bool:
+        _n, until = self._wall_state(prefix)
+        return time.time() < until
+
+    def _note_wall(self, prefix: str) -> None:
+        st = self._wall_state(prefix)
+        st[0] += 1
+        if st[0] >= 3:
+            # A JS challenge normally clears by itself; three in a row means we
+            # are being throttled, so pause this publisher instead of giving up
+            # on it for the whole run.
+            st[1] = time.time() + self.wall_cooldown_s
+            st[0] = 0
+
+    def _note_ok(self, prefix: str) -> None:
+        self.walled[prefix] = [0.0, 0.0]
 
     # ------------------------------------------------------------------
     def resolve(self, rec: Record) -> PdfResult:
@@ -211,46 +237,62 @@ class Resolver:
 
     # ------------------------------------------------------------------
     def _article_page(self, rec: Record) -> PdfResult:
-        if self.walled.get(rec.prefix, 0) >= 3:
+        if self._in_cooldown(rec.prefix):
             return PdfResult(None, "page", "blocked_bot",
-                             f"{rec.prefix} walled earlier in this run")
+                             f"{rec.prefix} cooling down after repeated challenges")
 
         page = self.browser._new_tab()
         try:
+            # Ask Crossref for the publisher landing URL first: it is one cheap
+            # API call, it skips the flaky doi.org hop, and it reveals when a
+            # journal has migrated to another platform (e.g. T&F -> Wiley).
+            targets = [u for u in (_crossref_url(rec.doi),) if u]
+            targets.append(f"https://doi.org/{rec.doi}")
             err = ""
             landed = False
-            for attempt in (1, 2):
-                try:
-                    page.goto(f"https://doi.org/{rec.doi}", wait_until="domcontentloaded",
-                              timeout=25_000)
-                    landed = True
+            for target in targets:
+                for _attempt in (1, 2):
+                    try:
+                        page.goto(target, wait_until="domcontentloaded", timeout=25_000)
+                        landed = True
+                        break
+                    except Exception as exc:
+                        err = repr(exc)[:180]
+                        page.wait_for_timeout(800)
+                if landed:
                     break
-                except Exception as exc:
-                    err = repr(exc)[:180]
-                    page.wait_for_timeout(1500)
             if not landed:
-                # doi.org is sometimes slow/throttled from a busy shared egress;
-                # ask Crossref for the publisher landing URL and go there directly.
-                alt = _crossref_url(rec.doi)
-                if not alt:
-                    return PdfResult(None, "page", "error", err)
-                try:
-                    page.goto(alt, wait_until="domcontentloaded", timeout=35_000)
-                except Exception as exc:
-                    return PdfResult(None, "page", "error",
-                                     f"{err} | crossref:{repr(exc)[:120]}")
+                return PdfResult(None, "page", "error", err)
             page.wait_for_timeout(1500)
             _ = self.browser.text(page, retries=1)
 
             if self.browser.is_bot_wall(page):
                 cleared = self.browser.wait_past_wall(page, self.wall_wait_s)
                 if not cleared:
-                    self.walled[rec.prefix] = self.walled.get(rec.prefix, 0) + 1
+                    self._note_wall(rec.prefix)
                     return PdfResult(None, "page", "blocked_bot",
                                      f"anti-bot wall on {_host(page.url)}")
 
             body = self.browser.text(page)
             low = body.lower()
+            host = _host(page.url)
+
+            # Redirect-only mirrors serve metadata but never a PDF; give up at
+            # once instead of burning minutes on their links.
+            if any(m in host for m in DEAD_HOSTS):
+                return PdfResult(None, "page", "no_pdf", f"{host} is a mirror without PDF")
+
+            # Journals that migrated between platforms keep serving the DOI on
+            # the new host; the platform's own direct-download route is then far
+            # more reliable than the legacy /doi/pdf/<doi> link on the page.
+            if "onlinelibrary.wiley.com" in host:
+                data = fetch_pdf(
+                    f"https://{host}/doi/pdfdirect/{rec.doi}?download=true",
+                    referer=page.url, browser=self.browser, timeout_ms=90_000)
+                if data:
+                    self._note_ok(rec.prefix)
+                    return PdfResult(data=data, source=f"page:{host}:pdfdirect", status="ok")
+
             pdf_url = self._citation_pdf_url(page)
             links = ([pdf_url] if pdf_url else []) + self.browser.find_pdf_links(page)
             links = [u for u in dict.fromkeys(links) if u and u.startswith("http")]
@@ -259,17 +301,20 @@ class Resolver:
                 k in low for k in ENTITLED_MARKERS)
             if paywalled:
                 return PdfResult(None, "page", "not_entitled",
-                                 f"paywall on {_host(page.url)}")
+                                 f"paywall on {host}")
             if not links:
                 return PdfResult(None, "page", "no_pdf",
-                                 f"no pdf link on {_host(page.url)} (len={len(body)})")
+                                 f"no pdf link on {host} (len={len(body)})")
 
             referer = page.url
-            for url in links[:6]:
+            # Cap each candidate: on a walled/paywalled host the first link can
+            # stall for minutes, and one slow article must not eat the batch.
+            link_timeout = min(self.timeout_ms, 50_000)
+            for url in links[:3]:
                 data = fetch_pdf(url, referer=referer, browser=self.browser,
-                                 timeout_ms=self.timeout_ms)
+                                 timeout_ms=link_timeout, curl_first=False)
                 if data:
-                    self.walled[rec.prefix] = 0
+                    self._note_ok(rec.prefix)
                     return PdfResult(data=data, source=f"page:{_host(url)}", status="ok")
                 if "yiigle" in url:
                     return PdfResult(None, "page", "blocked_bot",

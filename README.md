@@ -63,7 +63,21 @@ CSV ──► records.Record
 
 # 反爬站点的人工解锁（在 :0 桌面弹出 Chrome，人工完成验证码/登录一次）
 .venv/bin/python -m pubmed_dl login --urls https://www.sciencedirect.com/
+
+# 无 DOI 记录回填（Crossref 题名检索 + 年份校验，只补元数据、不下载）
+.venv/bin/python -m pubmed_dl.backfill pubmed_search.csv \
+    --out data/search_recovered.csv --state-dir downloads
 ```
+
+环境变量：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `PUBMED_DL_PROFILE_BASE` | `/tmp` | Chrome profile 根目录。默认放 tmpfs 很容易被十来个并发 profile 撑爆，建议指向 `~/.cache/pubmed_dl_chrome` |
+| `PUBMED_DL_SD_PACE` | `20` | ScienceDirect 每篇成功后的间隔秒数；低于 20 容易触发 `CPE00001` 会话冷却 |
+| `PUBMED_DL_PORT` | `9222` | `login` 使用的 CDP 端口 |
+| `PUBMED_DL_DISPLAY` | `:99` | 无头 Xvfb 显示号 |
+
 
 常用参数：
 
@@ -157,7 +171,11 @@ Spandidos、Via Medica、SciELO、Korean J Med Sci 等站点在校园网出口�
 
 ## 9. 已知限制
 
-- 无 DOI 的记录（本 CSV 中 576 条）无法解析到出版社，只能跳过。
+- 无 DOI 的记录无法直接解析到出版社；可用 `pubmed_dl.backfill` 做 Crossref 题名回填，
+  但 PubMed 里就缺 DOI 且 Crossref 也匹配不到的部分（1960–1980 年代、部分中文刊）只能跳过。
 - 订阅不覆盖的标题会返回 `not_entitled`，这是权限问题，不是抓取问题。
-- 反爬墙（captcha / Turnstile）不做自动破解；需要人工过一次验证后用 `login` 复用会话。
+- 反爬墙（captcha / Turnstile）不做自动破解；需要人工过一次验证后用 `login` 复用会话，
+  脚本只复用该会话的 cookie，并对同一前缀做 600 秒熔断（`Resolver._in_cooldown`）。
 - 个别出版社 PDF 走境外对象存储，速度可能低至 20 KB/s；已用 Range 断点续传兜底。
+- SAGE 等站点的中国镜像（`sage.cnpereading.com`）只给元数据不给 PDF，已列入 `DEAD_HOSTS` 快速失败。
+- 并发数受 `/tmp` 体积限制：十几条流同时跑必须把 `PUBMED_DL_PROFILE_BASE` 指向磁盘。

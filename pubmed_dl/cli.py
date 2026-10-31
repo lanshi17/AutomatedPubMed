@@ -25,12 +25,15 @@ def cmd_run(args) -> int:
         a, b = args.shard.split("/")
         shard, shards = int(a), int(b)
     base_port = args.port or defaults["port"]
+    # Chrome profiles grow to hundreds of MB each; keep them off tmpfs so a
+    # dozen parallel workers cannot exhaust /tmp.
+    profile_base = Path(os.environ.get("PUBMED_DL_PROFILE_BASE", "/tmp"))
     cfg = Config(
         out_dir=Path(args.out),
         csv_path=Path(args.csv) if args.csv else None,
         display=args.display or (":0" if args.interactive else defaults["display"]),
         port=base_port + shard,
-        profile_dir=Path(f"/tmp/pubmed_dl_chrome_{base_port + shard}"),
+        profile_dir=profile_base / f"pubmed_dl_chrome_{base_port + shard}",
         interactive=args.interactive,
         shard=shard, shards=shards,
         attempt_walled=args.attempt_walled,
@@ -86,8 +89,9 @@ def cmd_report(args) -> int:
 def cmd_login(args) -> int:
     """Open a visible browser on the user's desktop for manual sign-in/captcha."""
     port = int(os.environ.get("PUBMED_DL_PORT", "9222"))
+    profile_base = Path(os.environ.get("PUBMED_DL_PROFILE_BASE", "/tmp"))
     cfg = Config(out_dir=Path(args.out), display=":0", interactive=True,
-                 port=port, profile_dir=Path(f"/tmp/pubmed_dl_chrome_{port}"))
+                 port=port, profile_dir=profile_base / f"pubmed_dl_chrome_{port}")
     print("A Chrome window will open on your desktop.",
           "Complete any sign-in or 'I am human' check,", 
           "then close the window when you are done.", sep="\n")
