@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pubmed-dl"
+description = "Entitlement-aware PubMed PDF retrieval over a real Chrome session"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-only" }
+dynamic = ["version"]
+dependencies = [
+    "playwright==1.64.1",
+    "pypdf==6.21.2",
+    "requests==2.34.2",
+]
+
+[project.scripts]
+pubmed-dl = "pubmed_dl.cli:main"
+pubmed-dl-mcp = "pubmed_dl.mcp_server:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.20,<2",
+    "anyio>=4.5",
+]
+
+[tool.setuptools]
+packages = ["pubmed_dl"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pubmed_dl.__version__" }

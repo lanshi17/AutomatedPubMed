@@ -1,74 +1,31 @@
-"""Command line interface: python -m pubmed_dl <command>."""
+"""Command line interface: python -m pubmed_dl <command>.
+
+Thin formatting layer only; the pipeline itself lives in `pubmed_dl.api`.
+"""
 from __future__ import annotations
 
 import argparse
-import os
 import sys
-from pathlib import Path
 
-from .browser import Browser
-from .config import Config, env_defaults
-from .downloader import Downloader
-from .records import load_csv
-
-
-def _browser(cfg: Config) -> Browser:
-    b = Browser(port=cfg.port, display=cfg.display, profile=cfg.profile_dir,
-                timeout_ms=cfg.timeout_ms)
-    return b.start()
+from . import api
 
 
 def cmd_run(args) -> int:
-    defaults = env_defaults()
-    shard, shards = 0, 1
-    if args.shard:
-        a, b = args.shard.split("/")
-        shard, shards = int(a), int(b)
-    base_port = args.port or defaults["port"]
-    # Chrome profiles grow to hundreds of MB each; keep them off tmpfs so a
-    # dozen parallel workers cannot exhaust /tmp.
-    profile_base = Path(os.environ.get("PUBMED_DL_PROFILE_BASE", "/tmp"))
-    cfg = Config(
-        out_dir=Path(args.out),
-        csv_path=Path(args.csv) if args.csv else None,
-        display=args.display or (":0" if args.interactive else defaults["display"]),
-        port=base_port + shard,
-        profile_dir=profile_base / f"pubmed_dl_chrome_{base_port + shard}",
-        interactive=args.interactive,
-        shard=shard, shards=shards,
-        attempt_walled=args.attempt_walled,
-        oa_first=args.oa_first,
+    res = api.download_csv(
+        args.csv, args.out, prefix=args.prefix, only_pmcid=args.only_pmcid,
+        shard=args.shard, limit=args.limit, retry_failed=args.retry_failed,
+        attempt_walled=args.attempt_walled, oa_first=args.oa_first,
+        interactive=args.interactive, display=args.display, port=args.port,
+        log=print,
     )
-    records = load_csv(args.csv)
-    if args.prefix:
-        wanted = {p.strip().lower() for p in args.prefix.split(",")}
-        records = [r for r in records if r.prefix in wanted]
-    if shards > 1:
-        records = records[shard::shards]
-    if args.only_pmcid:
-        records = [r for r in records if r.pmcid]
-    if args.limit:
-        records = records[:args.limit]
-    browser = _browser(cfg)
-    dl = Downloader(cfg, browser)
-    try:
-        counts = dl.run(records, retry_failed=args.retry_failed, log=print)
-    finally:
-        browser.close()
-    dl.export_index()
-    dl.export_bibtex()
     print("\n== batch result ==")
-    for k, v in sorted(counts.items()):
+    for k, v in sorted(res.counts.items()):
         print(f"  {k:12s} {v}")
     return 0
 
 
 def cmd_report(args) -> int:
-    cfg = Config(out_dir=Path(args.out))
-    dl = Downloader(cfg)
-    if args.csv:
-        dl.reconcile_disk(Path(args.csv))
-    st = dl.stats()
+    st = api.report(args.out, csv=args.csv)
     print("== overall ==")
     for k, v in sorted(st["counts"].items()):
         print(f"  {k:12s} {v}")
@@ -79,24 +36,16 @@ def cmd_report(args) -> int:
         pct = 100.0 * ok / total if total else 0
         other = ", ".join(f"{k}:{v}" for k, v in d.items() if k != "ok")
         print(f"  {pref:12s} {ok:4d}/{total:<4d} ({pct:5.1f}%)  {other}")
-    dl.export_index()
-    dl.export_bibtex()
-    dl.export_missing()
-    (cfg.out_dir / "summary.md").write_text(dl.summary_markdown(), encoding="utf-8")
     return 0
 
 
 def cmd_login(args) -> int:
     """Open a visible browser on the user's desktop for manual sign-in/captcha."""
-    port = int(os.environ.get("PUBMED_DL_PORT", "9222"))
-    profile_base = Path(os.environ.get("PUBMED_DL_PROFILE_BASE", "/tmp"))
-    cfg = Config(out_dir=Path(args.out), display=":0", interactive=True,
-                 port=port, profile_dir=profile_base / f"pubmed_dl_chrome_{port}")
+    cfg = api.make_config(args.out, display=":0", interactive=True)
     print("A Chrome window will open on your desktop.",
-          "Complete any sign-in or 'I am human' check,", 
+          "Complete any sign-in or 'I am human' check,",
           "then close the window when you are done.", sep="\n")
-    b = Browser(port=cfg.port, display=":0", profile=cfg.profile_dir)
-    b.start()
+    b = api.start_browser(cfg)
     urls = args.urls or ["https://www.sciencedirect.com/"]
     for url in urls:
         b.goto(url, wait_ms=4000)
@@ -106,7 +55,8 @@ def cmd_login(args) -> int:
     status = {}
     for url in urls:
         try:
-            names = {c["name"] for c in b.context.cookies(url)}
+            ctx = b.context
+            names = {c["name"] for c in ctx.cookies(url)} if ctx else set()
             status[url] = sorted(n for n in names if "clearance" in n or n in
                                  ("SD_REMOTEACCESS", "ANONRA_COOKIE", "KARGER_SessionId"))
         except Exception:
@@ -121,91 +71,21 @@ def cmd_login(args) -> int:
 
 def cmd_probe(args) -> int:
     """Probe a single DOI and print what the pipeline sees."""
-    defaults = env_defaults()
-    cfg = Config(out_dir=Path(args.out), display=args.display or defaults["display"],
-                 port=args.port or defaults["port"])
-    records = load_csv(args.csv) if args.csv else []
-    rec = next((r for r in records if r.doi == args.doi), None)
-    if rec is None:
-        from .records import Record
-        rec = Record(pmid="", doi=args.doi, pmcid=args.pmcid or "", title=args.title or "",
-                     authors="", citation="", journal="", year="", first_author="")
-    b = _browser(cfg)
-    try:
-        from .publishers import resolve
-        result = resolve(rec, b)
-        print("status:", result.status, "| source:", result.source, "| detail:", result.detail)
-        if result.data:
-            print("bytes:", len(result.data), "magic:", result.data[:4])
-    finally:
-        b.close()
+    out = api.probe(args.doi, args.out, csv=args.csv, pmcid=args.pmcid or "",
+                    title=args.title or "", display=args.display, port=args.port)
+    print("status:", out["status"], "| source:", out["source"], "| detail:", out["detail"])
+    if out["bytes"]:
+        print("bytes:", out["bytes"], "magic:", out["magic"])
     return 0
 
 
 def cmd_verify(args) -> int:
     """Re-check every recorded PDF: magic bytes, page count, title match."""
-    import logging
-    import warnings
-    warnings.filterwarnings("ignore")
-    logging.getLogger("pypdf").setLevel(logging.CRITICAL)
-    from pypdf import PdfReader
-    cfg = Config(out_dir=Path(args.out))
-    dl = Downloader(cfg)
-    if getattr(args, "csv", None):
-        dl.reconcile_disk(Path(args.csv))
-    ok = bad = missing = 0
-    low = []
-    for row in dl.state.values():
-        if row.get("status") != "ok":
-            continue
-        path = Path(row.get("path", ""))
-        if not path.exists():
-            missing += 1
-            continue
-        try:
-            reader = PdfReader(str(path))
-            pages = len(reader.pages)
-            first = (reader.pages[0].extract_text() or "")[:2000]
-            sim = _sim(row.get("title", ""), first)
-            if pages >= 1 and path.read_bytes()[:4] == b"%PDF" and sim >= args.min_sim:
-                ok += 1
-            else:
-                bad += 1
-                low.append((sim, row.get("doi", ""), path.name))
-        except Exception as exc:
-            pages, first = _poppler_probe(path)
-            sim = _sim(row.get("title", ""), first)
-            if pages >= 1 and sim >= args.min_sim:
-                ok += 1
-            else:
-                bad += 1
-                low.append((sim, row.get("doi", ""), f"{path.name} ({repr(exc)[:40]})"))
-    print(f"verified ok: {ok}  suspect: {bad}  missing: {missing}")
-    for sim, doi, name in sorted(low)[:20]:
+    res = api.verify(args.out, min_sim=args.min_sim, csv=args.csv)
+    print(f"verified ok: {res['ok']}  suspect: {res['suspect']}  missing: {res['missing']}")
+    for sim, doi, name in res["low"]:
         print(f"  sim={sim} {doi} {name}")
     return 0
-
-
-def _poppler_probe(path: Path) -> tuple[int, str]:
-    import subprocess
-    pages = 0
-    text = ""
-    try:
-        out = subprocess.run(["pdfinfo", str(path)], capture_output=True, text=True, timeout=30)
-        for line in out.stdout.splitlines():
-            if line.startswith("Pages:"):
-                pages = int(line.split()[1])
-        out = subprocess.run(["pdftotext", "-f", "1", "-l", "1", str(path), "-"],
-                             capture_output=True, text=True, timeout=30)
-        text = (out.stdout or "")[:2000]
-    except Exception:
-        pass
-    return pages, text
-
-
-def _sim(a: str, b: str) -> float:
-    from .records import title_similarity
-    return round(title_similarity(a, b), 3)
 
 
 def main(argv=None) -> int:
@@ -220,11 +100,11 @@ def main(argv=None) -> int:
     r.add_argument("--retry-failed", action="store_true")
     r.add_argument("--shard", help="i/n shard selector for parallel workers")
     r.add_argument("--oa-first", action="store_true",
-                   help="try repositories before the publisher")
+                   help="try repositories/PMC before the publisher")
     r.add_argument("--only-pmcid", action="store_true",
-                   help="only records that have a PMCID (Europe PMC copies)")
+                   help="only records that carry a PMCID")
     r.add_argument("--attempt-walled", action="store_true",
-                   help="also try prefixes known to be behind anti-bot walls")
+                   help="also try publishers known to wall this route")
     r.add_argument("--interactive", action="store_true", help="use display :0")
     r.add_argument("--display")
     r.add_argument("--port", type=int)

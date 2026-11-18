@@ -371,3 +371,8 @@ class Resolver:
             )
         except Exception:
             return None
+
+
+def resolve(rec: Record, browser: Browser, *, timeout_ms: int = 120_000) -> PdfResult:
+    """One-shot resolution without the per-prefix wall cache of `Resolver`."""
+    return Resolver(browser, timeout_ms=timeout_ms).resolve(rec)

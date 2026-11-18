@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import signal
+import threading
 import random
 import time
 import warnings
@@ -248,7 +249,7 @@ class Downloader:
 
     # -- batch -------------------------------------------------------------
     def run(self, records: list[Record], limit: int | None = None, retry_failed: bool = False,
-            log=print) -> dict:
+            log=print, use_alarm: bool = True) -> dict:
         todo = []
         for rec in records:
             if self.done(rec):
@@ -260,39 +261,49 @@ class Downloader:
         if limit:
             todo = todo[:limit]
         counts: dict[str, int] = {}
-        old_handler = signal.getsignal(signal.SIGALRM)
-        signal.signal(signal.SIGALRM, _alarm_handler)
+        # SIGALRM is main-thread only; embedded callers (api.py) may run this
+        # elsewhere, where timeout_ms per request is the only cap.
+        can_alarm = use_alarm and threading.current_thread() is threading.main_thread()
+        old_handler = signal.getsignal(signal.SIGALRM) if can_alarm else None
+        if can_alarm:
+            signal.signal(signal.SIGALRM, _alarm_handler)
         cap = max(120, self.cfg.timeout_ms // 1000 * 4)
-        for i, rec in enumerate(todo, 1):
-            signal.setitimer(signal.ITIMER_REAL, cap)
-            try:
-                row = self.process_one(rec)
-            except RecordTimeout:
+        try:
+            for i, rec in enumerate(todo, 1):
+                if can_alarm:
+                    signal.setitimer(signal.ITIMER_REAL, cap)
                 try:
-                    self.browser.reset()
-                except Exception:
-                    pass
-                row = {"key": rec.key, "pmid": rec.pmid, "doi": rec.doi,
-                       "status": "error", "detail": f"record timeout after {cap}s",
-                       "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                self._append_state(row)
-            except Exception as exc:  # keep the batch alive
-                detail = repr(exc)[:300]
-                if "TargetClosed" in detail or "Target page" in detail or "crash" in detail:
+                    row = self.process_one(rec)
+                except RecordTimeout:
                     try:
-                        self.browser.restart()
-                    except Exception as exc2:
-                        detail += f" | restart failed: {repr(exc2)[:120]}"
-                row = {"key": rec.key, "pmid": rec.pmid, "doi": rec.doi,
-                       "status": "error", "detail": detail,
-                       "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                self._append_state(row)
-            finally:
+                        self.browser.reset()
+                    except Exception:
+                        pass
+                    row = {"key": rec.key, "pmid": rec.pmid, "doi": rec.doi,
+                           "status": "error", "detail": f"record timeout after {cap}s",
+                           "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                    self._append_state(row)
+                except Exception as exc:  # keep the batch alive
+                    detail = repr(exc)[:300]
+                    if "TargetClosed" in detail or "Target page" in detail or "crash" in detail:
+                        try:
+                            self.browser.restart()
+                        except Exception as exc2:
+                            detail += f" | restart failed: {repr(exc2)[:120]}"
+                    row = {"key": rec.key, "pmid": rec.pmid, "doi": rec.doi,
+                           "status": "error", "detail": detail,
+                           "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                    self._append_state(row)
+                finally:
+                    if can_alarm:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                counts[row["status"]] = counts.get(row["status"], 0) + 1
+                log(f"[{i}/{len(todo)}] {row['status']:12s} {rec.pmid or ''} {rec.doi} "
+                    f"({row.get('source', row.get('detail', ''))})")
+        finally:
+            if can_alarm:
                 signal.setitimer(signal.ITIMER_REAL, 0)
-            counts[row["status"]] = counts.get(row["status"], 0) + 1
-            log(f"[{i}/{len(todo)}] {row['status']:12s} {rec.pmid or ''} {rec.doi} "
-                f"({row.get('source', row.get('detail', ''))})")
-        signal.signal(signal.SIGALRM, old_handler)
+                signal.signal(signal.SIGALRM, old_handler)
         return counts
 
     # -- reporting ---------------------------------------------------------

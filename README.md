@@ -69,16 +69,6 @@ CSV ──► records.Record
     --out data/search_recovered.csv --state-dir downloads
 ```
 
-环境变量：
-
-| 变量 | 默认 | 作用 |
-| --- | --- | --- |
-| `PUBMED_DL_PROFILE_BASE` | `/tmp` | Chrome profile 根目录。默认放 tmpfs 很容易被十来个并发 profile 撑爆，建议指向 `~/.cache/pubmed_dl_chrome` |
-| `PUBMED_DL_SD_PACE` | `20` | ScienceDirect 每篇成功后的间隔秒数；低于 20 容易触发 `CPE00001` 会话冷却 |
-| `PUBMED_DL_PORT` | `9222` | `login` 使用的 CDP 端口 |
-| `PUBMED_DL_DISPLAY` | `:99` | 无头 Xvfb 显示号 |
-
-
 常用参数：
 
 | 参数 | 作用 |
@@ -88,6 +78,76 @@ CSV ──► records.Record
 | `--retry-failed` | 重试此前失败的记录（配合人工解锁） |
 | `--attempt-walled` | 对被判定为反爬墙的前缀也尝试页面解析 |
 | `--shard i/n` | 分片并发 |
+
+环境变量：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `PUBMED_DL_PROFILE_BASE` | `/tmp` | Chrome profile 根目录。默认放 tmpfs 很容易被十来个并发 profile 撑爆，建议指向 `~/.cache/pubmed_dl_chrome` |
+| `PUBMED_DL_SD_PACE` | `20` | ScienceDirect 每篇成功后的间隔秒数；低于 20 容易触发 `CPE00001` 会话冷却 |
+| `PUBMED_DL_PORT` | `9222` | `login` 使用的 CDP 端口 |
+| `PUBMED_DL_DISPLAY` | `:99` | 无头 Xvfb 显示号 |
+
+### 3.1 安装为命令 / 作为 SDK 调用
+
+```bash
+pip install -e .          # 之后 pubmed-dl 等价于 python -m pubmed_dl
+```
+
+程序化入口是 `pubmed_dl/api.py`（CLI 只是它的格式化层），不打印、不解析参数：
+
+```python
+from pubmed_dl import api
+
+res = api.download(["10.3389/fgene.2024.1401315", "33423259"], out="downloads")
+res.counts          # {'ok': 1, 'blocked_bot': 1}
+res.rows            # 该批次的 state 行（status/source/pages/path/...）
+res.index_csv       # downloads/index.csv
+
+api.download_csv("data/csv-ultrasound-set.csv", "downloads", limit=5, prefix="10.3390")
+api.report("downloads")                       # -> stats dict，同时刷新 index/bib/summary.md
+api.probe("10.3389/fgene.2024.1401315")       # -> {status, source, detail, bytes, magic}
+api.verify("downloads", min_sim=0.35)         # -> {ok, suspect, missing, low}
+```
+
+- DOI 可写裸串、`doi:` 前缀或 `https://doi.org/...`；纯数字按 PMID 处理。
+- 传入 `browser=` 可复用已有 `Browser`（生命周期由调用方负责，否则内部 `start_browser` / `close`）。
+- Playwright 同步 API 绑定线程：`Browser` 必须在调用线程创建与使用。
+- 单条墙钟超时依赖 SIGALRM，只在主线程生效；在工作线程调用时退化为按请求 `timeout_ms` 兜底。
+
+### 3.2 MCP 服务器（stdio）
+
+```bash
+pip install -e '.[mcp]'
+pubmed-dl-mcp            # 或 python -m pubmed_dl.mcp_server
+```
+
+客户端配置（Claude Desktop / Claude Code / Codex，任意 stdio 客户端）：
+
+```json
+{
+  "mcpServers": {
+    "pubmed-dl": {
+      "command": "/data/yangzs/Projects/05_Tools/04_AutomatedPubMed/.venv/bin/pubmed-dl-mcp",
+      "env": { "PUBMED_DL_DISPLAY": ":99", "PUBMED_DL_PORT": "9222" }
+    }
+  }
+}
+```
+
+| 工具 | 只读 | 作用 |
+| --- | --- | --- |
+| `pubmed_download` | 否 | DOI/PMID 列表 → PDF；返回 `counts`/`rows`（最多 50 行明细） |
+| `pubmed_download_csv` | 否 | PubMed CSV 批量下载，支持 `prefix` / `only_pmcid` / `shard` / `limit` |
+| `pubmed_report` | 否 | 汇总运行目录并刷新 `index.csv` / `references.bib` / `missing.csv` / `summary.md` |
+| `pubmed_probe` | 是 | 单 DOI 诊断（`status` / `source` / `bytes` / `magic`），不落盘 |
+| `pubmed_verify` | 是 | 复核已下载 PDF（magic / 页数 / 标题重合度） |
+
+- 浏览器是单占位资源：并发调用第二个下载会直接返回提示错误，而不是抢 9222 端口。
+- 工具内是阻塞流水线，走 `anyio.to_thread` 执行，事件循环仍能响应 ping/取消。
+- stdout 是 JSON-RPC 流；服务器自身不打印。长批次用 `limit` 分批，状态文件保证断点续跑。
+
+
 
 ## 4. 输出
 
