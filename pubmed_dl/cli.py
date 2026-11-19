@@ -11,12 +11,15 @@ from . import api
 
 
 def cmd_run(args) -> int:
+    extra = {"wall_wait_s": args.wall_wait} if args.wall_wait is not None else {}
+    if args.browser_act is not None:
+        extra["browser_act"] = args.browser_act or None
     res = api.download_csv(
         args.csv, args.out, prefix=args.prefix, only_pmcid=args.only_pmcid,
         shard=args.shard, limit=args.limit, retry_failed=args.retry_failed,
         attempt_walled=args.attempt_walled, oa_first=args.oa_first,
         interactive=args.interactive, display=args.display, port=args.port,
-        log=print,
+        log=print, **extra,
     )
     print("\n== batch result ==")
     for k, v in sorted(res.counts.items()):
@@ -105,6 +108,10 @@ def main(argv=None) -> int:
                    help="only records that carry a PMCID")
     r.add_argument("--attempt-walled", action="store_true",
                    help="also try publishers known to wall this route")
+    r.add_argument("--wall-wait", type=float, default=None,
+                   help="seconds to wait for a JS challenge to clear (default 60)")
+    r.add_argument("--browser-act", default=None,
+                   help="browser-act browser name; empty string disables the backend")
     r.add_argument("--interactive", action="store_true", help="use display :0")
     r.add_argument("--display")
     r.add_argument("--port", type=int)

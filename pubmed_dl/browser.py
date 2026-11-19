@@ -23,17 +23,28 @@ from pathlib import Path
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
+# Markers that only appear on an interstitial.  Article pages do not contain
+# them, so these can be tested without a body-length guard.
 BOT_WALL_MARKERS = (
     "just a moment",
     "请稍候",
     "attention required",
     "are you a robot",
     "performing security verification",
-    "verify you are human",
+    "checking if the site connection is secure",
+    "enable javascript and cookies to continue",
     "checking your browser",
-    "captcha",
-    "access denied",
+    "verify you are human",
+    "安全验证",
+    "请完成验证",
 )
+
+# Weaker phrases that also occur in ordinary prose; only trust them on a page
+# that has not rendered yet.
+WEAK_WALL_MARKERS = ("captcha", "access denied", "ddos-guard")
+
+# URL fragments set by the challenge platform itself.
+BOT_WALL_URL_MARKERS = ("__cf_chl", "/cdn-cgi/challenge-platform/", "/captcha")
 
 CHROME_CANDIDATES = (
     "/usr/bin/google-chrome",
@@ -228,34 +239,57 @@ class Browser:
             return ""
 
     def is_bot_wall(self, page=None) -> bool:
+        """True while a bot challenge is still standing between us and the article.
+
+        Cloudflare/ScienceDirect serve the challenge shell with HTTP 200/403 and
+        only then run the JS that either clears it or shows a captcha.  The
+        interstitial titles/body text are stable markers; anything else is
+        treated as the real page (some publishers render an empty body text for
+        embedded viewers even after the article is available).
+        """
         page = page or self.page
-        t = self.title(page).lower()
+        try:
+            title = (page.title() or "").lower()
+        except Exception:
+            return True  # navigation in flight: poll again
+        try:
+            url = (page.url or "").lower()
+        except Exception:
+            url = ""
+        if any(m in url for m in BOT_WALL_URL_MARKERS):
+            return True
+        if any(m in title for m in BOT_WALL_MARKERS):
+            return True
         body = self.text(page)
         low = body.lower()
-        url = (page.url or "").lower()
-        if "just a moment" in t or "请稍候" in t or "attention required" in t:
+        if any(m in low for m in BOT_WALL_MARKERS):
             return True
-        if "__cf_chl" in url or "/captcha" in url or "challenge" in t:
-            return True
-        if "are you a robot" in low or "performing security verification" in low:
-            return True
-        if "安全验证" in body or "请完成验证" in body:
-            return True
-        if len(body) < 400 and any(m in low for m in BOT_WALL_MARKERS):
-            return True
-        if len(body) < 400 and ("sciencedirect" in url or "karger" in url):
-            # SD/Karger captcha pages render a very small shell
+        if len(body) < 400 and any(m in low for m in WEAK_WALL_MARKERS):
             return True
         return False
 
-    def wait_past_wall(self, page=None, seconds: float = 25.0) -> bool:
-        """Give a JS challenge a chance to clear on its own. Returns True if clear."""
+    def wait_past_wall(self, page=None, seconds: float = 60.0) -> bool:
+        """Give a JS challenge a chance to clear on its own. Returns True if clear.
+
+        A managed Cloudflare check took 18-45 s on the campus route; clearing is
+        not instantaneous, and polling must tolerate the document being
+        replaced mid-check.  Require two consecutive clean observations so a
+        transient blank shell is not mistaken for the article.
+        """
         page = page or self.page
         deadline = time.time() + seconds
+        clean = 0
         while time.time() < deadline:
-            if not self.is_bot_wall(page):
-                return True
-            page.wait_for_timeout(1500)
+            if self.is_bot_wall(page):
+                clean = 0
+            else:
+                clean += 1
+                if clean >= 2:
+                    return True
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                return False
         return not self.is_bot_wall(page)
 
     # -- fetching ----------------------------------------------------------

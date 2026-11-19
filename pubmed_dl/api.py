@@ -90,6 +90,7 @@ def make_config(out: str | Path = "downloads", *, csv: str | Path | None = None,
         interactive=interactive,
         shard=shard_i,
         shards=shards,
+        browser_act_session="pubmed-pub" if shards == 1 else f"pubmed-pub-s{shard_i}",
         **overrides,
     )
 
@@ -115,6 +116,21 @@ def make_record(ident: str, *, pmcid: str = "", title: str = "", authors: str = 
 def start_browser(cfg: Config) -> Browser:
     return Browser(port=cfg.port, display=cfg.display, profile=cfg.profile_dir,
                    timeout_ms=cfg.timeout_ms).start()
+
+
+def _make_act(cfg: Config, browser: Browser, *, session: str | None = None):
+    """Build the browser-act backend when the named browser exists."""
+    if not cfg.browser_act:
+        return None
+    try:
+        from .browser_act import BrowserAct
+        act = BrowserAct(browser=browser, name=cfg.browser_act,
+                         session=session or cfg.browser_act_session,
+                         wall_wait_s=cfg.wall_wait_s,
+                         display=getattr(browser, "display", ":99"))
+        return act if act.available() else None
+    except Exception:
+        return None
 
 
 # -- download -------------------------------------------------------------
@@ -194,9 +210,16 @@ def probe(doi: str, out: str | Path = "downloads", *, csv: str | Path | None = N
     if rec is None:
         rec = make_record(doi, pmcid=pmcid, title=title)
     b = start_browser(cfg)
+    act = _make_act(cfg, b, session="pubmed-pub-probe")
     try:
-        result = resolve(rec, b, timeout_ms=cfg.timeout_ms * 3)
+        result = resolve(rec, b, timeout_ms=cfg.timeout_ms * 3,
+                         wall_wait_s=cfg.wall_wait_s, act=act,
+                         rounds=cfg.resolve_rounds,
+                         wall_cooldown_s=cfg.wall_cooldown_s,
+                         act_first=cfg.act_first)
     finally:
+        if act:
+            act.close()
         b.close()
     return {"status": result.status, "source": result.source,
             "detail": result.detail, "bytes": len(result.data or b""),

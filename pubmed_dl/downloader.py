@@ -18,8 +18,8 @@ from . import sources
 from .browser import Browser
 from .config import Config
 from .fetch import fetch_pdf
-from .publishers import (PdfResult, PROXY_FALLBACK_PREFIXES, Resolver,
-                         WALLED_PREFIXES, proxy_page_resolve)
+from .publishers import (ACT_PREFIXES, PdfResult, PROXY_FALLBACK_PREFIXES,
+                         Resolver, WALLED_PREFIXES, proxy_page_resolve)
 from .records import Record, load_csv, title_similarity
 
 
@@ -35,7 +35,23 @@ class Downloader:
     def __init__(self, cfg: Config, browser: Browser | None = None):
         self.cfg = cfg
         self.browser = browser
-        self.resolver = Resolver(browser, timeout_ms=cfg.timeout_ms * 3) if browser else None
+        self.act = None
+        if browser is not None and cfg.browser_act:
+            try:
+                from .browser_act import BrowserAct
+                act = BrowserAct(browser=browser, name=cfg.browser_act,
+                                 session=cfg.browser_act_session,
+                                 wall_wait_s=cfg.wall_wait_s,
+                                 display=getattr(browser, "display", ":99"))
+                self.act = act if act.available() else None
+            except Exception:
+                self.act = None
+        self.resolver = Resolver(browser, wall_wait_s=cfg.wall_wait_s,
+                                 wall_cooldown_s=cfg.wall_cooldown_s,
+                                 rounds=cfg.resolve_rounds,
+                                 act_first=cfg.act_first,
+                                 timeout_ms=cfg.timeout_ms * 3,
+                                 act=self.act) if browser else None
         self.state: dict[str, dict] = {}
         self._load_state()
         self.records: list[Record] = []
@@ -197,6 +213,13 @@ class Downloader:
             result = proxy_page_resolve(rec, self.cfg.proxy_url)
             if result and result.data:
                 time.sleep(random.uniform(0.3, 1.0))
+        # Give challenged publishers room to breathe: repeated hit-and-run is
+        # what turns a managed challenge into a hard block.
+        if rec.prefix in ACT_PREFIXES:
+            if result and result.status == "blocked_bot":
+                time.sleep(self.cfg.wall_backoff_s)
+            else:
+                time.sleep(random.uniform(0.8, 1.4) * self.cfg.act_delay_s)
         if rec.prefix == "10.1016":
             if result and result.status == "ok":
                 self._sd_next_at = time.time() + self.cfg.sd_pace
@@ -267,7 +290,10 @@ class Downloader:
         old_handler = signal.getsignal(signal.SIGALRM) if can_alarm else None
         if can_alarm:
             signal.signal(signal.SIGALRM, _alarm_handler)
-        cap = max(120, self.cfg.timeout_ms // 1000 * 4)
+        # The cap must cover a challenge wait plus navigation and PDF fetch,
+        # otherwise a page that is about to clear gets killed mid-check.
+        cap = max(300, self.cfg.timeout_ms // 1000 * 4,
+                  int(self.cfg.wall_wait_s) * max(1, self.cfg.resolve_rounds) + 240)
         try:
             for i, rec in enumerate(todo, 1):
                 if can_alarm:
@@ -304,6 +330,8 @@ class Downloader:
             if can_alarm:
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 signal.signal(signal.SIGALRM, old_handler)
+            if self.act:
+                self.act.close()
         return counts
 
     # -- reporting ---------------------------------------------------------

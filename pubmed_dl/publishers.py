@@ -51,14 +51,66 @@ DIRECT: dict[str, tuple[str, str]] = {
 
 WILEY_PREFIXES = {"10.1002", "10.1111", "10.1046", "10.7863", "10.1111"}
 
-# Prefixes that are known to put an anti-bot wall in front of every article.
+# Prefixes with an interactive check (not a managed challenge) or no working
+# route at all.  These are skipped unless --attempt-walled.  Cloudflare managed
+# challenges (JAMA, NEJM, ...) are not listed: they clear by themselves and the
+# resolver waits them out.
 WALLED_PREFIXES = {
-    "10.1001",  # JAMA (Cloudflare)
-    "10.1056",  # NEJM (Cloudflare)
-    "10.1126",  # Science/AAAS (Cloudflare)
+    "10.1126",  # Science/AAAS (Cloudflare; not re-verified)
     "10.3760",  # Chinese Medical Association / Yiigle (captcha on PDF)
-    "10.1055",  # Thieme (very slow / walled)
+    "10.1055",  # Thieme (very slow / connection failures)
 }
+
+# Registry domain per browser-act prefix, used to check whether its cookie
+# jar already holds a clearance cookie.
+ACT_DOMAINS = {
+    "10.1001": "jamanetwork.com",
+    "10.1056": "nejm.org",
+    "10.1080": "tandfonline.com",
+    "10.3109": "tandfonline.com",
+    "10.1093": "oup.com",
+    "10.1136": "bmj.com",
+    "10.1159": "karger.com",
+    "10.1177": "sagepub.com",
+    "10.1148": "rsna.org",
+    "10.1126": "science.org",
+}
+
+# Hosts whose article pages sit behind a JS challenge (Cloudflare managed
+# challenge on the campus route).  Their PDF endpoints need the clearance
+# cookie, so the browser context must carry the request, not bare curl.
+# DOI prefixes resolved through browser-act first (see browser_act.py).
+ACT_PREFIXES = frozenset({
+    "10.1001",  # JAMA
+    "10.1056",  # NEJM
+    "10.1080",  # T&F
+    "10.3109",  # T&F (legacy)
+    "10.1093",  # OUP
+    "10.1136",  # BMJ
+    "10.1159",  # Karger
+    "10.1177",  # SAGE
+    "10.1148",  # RSNA
+    "10.1126",  # Science
+})
+
+CHALLENGE_FRONTED_HOSTS = (
+    "karger.com",
+    "tandfonline.com",
+    "sagepub.com",
+    "rsna.org",
+    "oup.com",
+    "bmj.com",
+    "jamanetwork.com",
+    "nejm.org",
+    "science.org",
+    "yiigle.com",
+)
+
+
+def _challenge_fronted(url: str) -> bool:
+    host = _host(url)
+    return any(host == h or host.endswith("." + h) for h in CHALLENGE_FRONTED_HOSTS)
+
 
 # Sites that are unreachable from the campus route; we retry them through the
 # user's own VPN (connectivity fallback for open-access content, not an
@@ -166,12 +218,20 @@ def _host(url: str) -> str:
 
 
 class Resolver:
-    def __init__(self, browser: Browser, wall_wait_s: float = 20.0, timeout_ms: int = 120_000,
-                 wall_cooldown_s: float = 600.0):
+    def __init__(self, browser: Browser, wall_wait_s: float = 90.0, timeout_ms: int = 120_000,
+                 wall_cooldown_s: float = 180.0, act=None, rounds: int = 2,
+                 act_first: bool = False):
         self.browser = browser
         self.wall_wait_s = wall_wait_s
         self.timeout_ms = timeout_ms
         self.wall_cooldown_s = wall_cooldown_s
+        self.act = act  # pubmed_dl.browser_act.BrowserAct | None
+        self.rounds = max(1, rounds)
+        # Prefixes where browser-act already produced a PDF: use it first for
+        # the remaining records, since its cookie jar stays warm.
+        self.act_first = act_first
+        self.act_ok_prefixes: set[str] = set()
+        self._warm_checked: set[str] = set()
         # prefix -> [consecutive_walls, cooldown_until_ts]
         self.walled: dict[str, list[float]] = {}
 
@@ -185,10 +245,10 @@ class Resolver:
     def _note_wall(self, prefix: str) -> None:
         st = self._wall_state(prefix)
         st[0] += 1
-        if st[0] >= 3:
-            # A JS challenge normally clears by itself; three in a row means we
-            # are being throttled, so pause this publisher instead of giving up
-            # on it for the whole run.
+        if st[0] >= 5:
+            # A JS challenge normally clears by itself; five in a row means we
+            # are being throttled, so pause this publisher briefly instead of
+            # burning every remaining record on it.
             st[1] = time.time() + self.wall_cooldown_s
             st[0] = 0
 
@@ -197,12 +257,76 @@ class Resolver:
 
     # ------------------------------------------------------------------
     def resolve(self, rec: Record) -> PdfResult:
+        """Resolve one DOI, preferring completeness over latency.
+
+        Each round runs the cheap direct endpoint, the Playwright page and the
+        browser-act fallback.  A second round re-tries transient challenge /
+        network verdicts; a real paywall (``not_entitled``) returns at once.
+        """
         if not rec.doi:
             return PdfResult(None, "none", "no_pdf", "record has no DOI")
-        result = self._direct(rec)
-        if result:
-            return result
-        return self._article_page(rec)
+        last: PdfResult | None = None
+        rounds = 1 if self._in_cooldown(rec.prefix) else self.rounds
+        if self.act_first and rec.prefix not in self._warm_checked:
+            self._warm_checked.add(rec.prefix)
+            if self._act_warm(rec.prefix):
+                self.act_ok_prefixes.add(rec.prefix)
+        act_first = self.act_first and rec.prefix in self.act_ok_prefixes
+        tried_act = False
+        for round_i in range(rounds):
+            if act_first and not tried_act:
+                tried_act = True
+                hit = self._try_act(rec)
+                if hit:
+                    return hit
+
+            result = self._direct(rec)
+            if result and result.status == "ok":
+                self._note_ok(rec.prefix)
+                return result
+            if result and result.status == "not_entitled":
+                return result
+            last = last or result
+
+            page = self._article_page(rec)
+            if page.status == "ok":
+                return page
+            if page.status == "not_entitled":
+                return page
+            last = page
+
+            if not tried_act:
+                tried_act = True
+                hit = self._try_act(rec)
+                if hit:
+                    return hit
+
+            if round_i + 1 < rounds:
+                time.sleep(2.0)
+        return last or PdfResult(None, "page", "no_pdf", "no candidate")
+
+    def _act_warm(self, prefix: str) -> bool:
+        """True when browser-act already holds a clearance cookie for the domain."""
+        if self.act is None or prefix not in ACT_DOMAINS:
+            return False
+        try:
+            if not self.act.ensure():
+                return False
+            cookies = self.act.export_cookies(f"https://{ACT_DOMAINS[prefix]}/")
+        except Exception:
+            return False
+        return any(c.get("name") == "cf_clearance" for c in cookies)
+
+    def _try_act(self, rec: Record) -> PdfResult | None:
+        if self.act is None or rec.prefix not in ACT_PREFIXES:
+            return None
+        data, source, _detail = self.act.resolve(rec.doi)
+        if data:
+            self._note_ok(rec.prefix)
+            self.act_ok_prefixes.add(rec.prefix)
+            return PdfResult(data=data, source=source, status="ok")
+        self._note_wall(rec.prefix)
+        return None
 
     # ------------------------------------------------------------------
     def _direct(self, rec: Record) -> PdfResult | None:
@@ -214,7 +338,8 @@ class Resolver:
             if aid:
                 url = f"https://karger.com/Article/Pdf/{aid}"
                 data = fetch_pdf(url, referer=f"https://karger.com/doi/{rec.doi}",
-                                 browser=self.browser, timeout_ms=self.timeout_ms)
+                                 browser=self.browser, timeout_ms=self.timeout_ms,
+                                 curl_first=False)
                 if data:
                     return PdfResult(data=data, source="direct:10.1159", status="ok")
         if rec.prefix == "10.3389":
@@ -230,7 +355,9 @@ class Resolver:
         _, template = entry
         url = template.format(doi=rec.doi, suffix=_suffix(rec.doi))
         referer = "https://onlinelibrary.wiley.com/" if url.startswith("https://onlinelibrary") else None
-        data = fetch_pdf(url, referer=referer, browser=self.browser, timeout_ms=self.timeout_ms)
+        data = fetch_pdf(url, referer=referer, browser=self.browser,
+                         timeout_ms=self.timeout_ms,
+                         curl_first=not _challenge_fronted(url))
         if data:
             return PdfResult(data=data, source=f"direct:{rec.prefix}", status="ok")
         return None
@@ -253,11 +380,20 @@ class Resolver:
             for target in targets:
                 for _attempt in (1, 2):
                     try:
-                        page.goto(target, wait_until="domcontentloaded", timeout=25_000)
+                        page.goto(target, wait_until="domcontentloaded", timeout=40_000)
                         landed = True
                         break
                     except Exception as exc:
                         err = repr(exc)[:180]
+                        # The challenge document can hold DOMContentLoaded past
+                        # the cap and render the article anyway; keep the tab
+                        # when it already sits on the requested URL.
+                        try:
+                            if (page.url or "").startswith("http"):
+                                landed = True
+                                break
+                        except Exception:
+                            pass
                         page.wait_for_timeout(800)
                 if landed:
                     break
@@ -274,6 +410,14 @@ class Resolver:
                                      f"anti-bot wall on {_host(page.url)}")
 
             body = self.browser.text(page)
+            if len(body) < 200 and not self.browser.is_bot_wall(page):
+                # A slow article shell can render after DOMContentLoaded; do
+                # not declare no_pdf against an empty document.
+                for _ in range(10):
+                    page.wait_for_timeout(1500)
+                    body = self.browser.text(page)
+                    if len(body) >= 200:
+                        break
             low = body.lower()
             host = _host(page.url)
 
@@ -329,6 +473,9 @@ class Resolver:
     def _elsevier(self, rec: Record) -> PdfResult:
         """ScienceDirect: the PDF lives behind a tokenised asset URL, so we
         intercept the response body through CDP instead of downloading it."""
+        if self._in_cooldown("10.1016"):
+            return PdfResult(None, "elsevier", "blocked_bot",
+                             "ScienceDirect cooling down after repeated challenges")
         page = self.browser._new_tab()
         try:
             try:
@@ -338,6 +485,7 @@ class Resolver:
                 return PdfResult(None, "elsevier", "error", repr(exc)[:150])
             page.wait_for_timeout(1200)
             if self.browser.is_bot_wall(page) and not self.browser.wait_past_wall(page, 20):
+                self._note_wall("10.1016")
                 return PdfResult(None, "elsevier", "blocked_bot", "ScienceDirect challenge")
             body = self.browser.text(page, retries=1)
             low = body.lower()
@@ -373,6 +521,10 @@ class Resolver:
             return None
 
 
-def resolve(rec: Record, browser: Browser, *, timeout_ms: int = 120_000) -> PdfResult:
+def resolve(rec: Record, browser: Browser, *, timeout_ms: int = 120_000,
+            wall_wait_s: float = 90.0, act=None, rounds: int = 2,
+            wall_cooldown_s: float = 180.0, act_first: bool = False) -> PdfResult:
     """One-shot resolution without the per-prefix wall cache of `Resolver`."""
-    return Resolver(browser, timeout_ms=timeout_ms).resolve(rec)
+    return Resolver(browser, wall_wait_s=wall_wait_s, timeout_ms=timeout_ms,
+                    wall_cooldown_s=wall_cooldown_s, act=act,
+                    rounds=rounds, act_first=act_first).resolve(rec)
