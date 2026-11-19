@@ -247,7 +247,7 @@ downloads/
 
 | 类型 | 表现 | 处理 |
 | --- | --- | --- |
-| 托管挑战（Cloudflare managed challenge） | `Just a moment…` / `Performing security verification`，18–45 s 后自动跳文章 | 等待即可（`--wall-wait`，默认 60 s），不模拟点击、不改写页面；通过后同一上下文复用 `cf_clearance` |
+| 托管挑战（Cloudflare managed challenge） | `Just a moment…` / `Performing security verification`，18–45 s 后自动跳文章 | 等待即可（`--wall-wait`，默认 90 s），不模拟点击、不改写页面；通过后同一上下文复用 `cf_clearance` |
 | 交互式验证（ScienceDirect captcha、Yiigle `安全验证`） | 必须人工点选/输入 | 只能用 `login` 人工过一次，复用会话 |
 
 交互式验证技术上可自动化，但属于规避访问控制，工具**不**这样做：
@@ -272,7 +272,7 @@ export PUBMED_DL_ACT_DELAY=8 PUBMED_DL_WALL_BACKOFF=30
 ```
 
 - 每条：直链 → Playwright（最多 120 s/次）→ browser-act（独立 cookie 罐）→ 最多 3 轮；
-- 某个前缀一旦由 browser-act 成功，后续记录优先走 browser-act 的暖 cookie；
+- browser-act 成功后保留其暖 cookie；只有设置 `PUBMED_DL_ACT_FIRST=1` 才会优先走它（默认 Playwright 优先）；
 - 连续失败给同前缀 20–30 s 退避，连续 5 次未通过才冷却 180 s；
 - `not_entitled` 立即返回，不做无意义重试；ScienceDirect / Yiigle 的交互式验证仍需 `login`。
 
@@ -319,9 +319,9 @@ Spandidos、Via Medica、SciELO、Korean J Med Sci 等站点在校园网出口�
 - 无 DOI 的记录无法直接解析到出版社；可用 `pubmed_dl.backfill` 做 Crossref 题名回填，
   但 PubMed 里就缺 DOI 且 Crossref 也匹配不到的部分（1960–1980 年代、部分中文刊）只能跳过。
 - 订阅不覆盖的标题会返回 `not_entitled`，这是权限问题，不是抓取问题。
-- 托管挑战只等待其自行通过（默认 60 s），交互式验证（ScienceDirect / Yiigle）不做自动破解；
-  需要人工过一次后用 `login` 复用会话。仍对连续未通过的同一前缀做 600 秒熔断
-  （`Resolver._in_cooldown`）。
+- 托管挑战只等待其自行通过（默认 90 s），交互式验证（ScienceDirect / Yiigle）不做自动破解；
+  需要人工过一次后用 `login` 复用会话。仍对连续未通过的同一前缀做可配置冷却
+  （`PUBMED_DL_COOLDOWN`，默认 180 s）。
 - 个别出版社 PDF 走境外对象存储，速度可能低至 20 KB/s；已用 Range 断点续传兜底。
 - SAGE 等站点的中国镜像（`sage.cnpereading.com`）只给元数据不给 PDF，已列入 `DEAD_HOSTS` 快速失败。
 - 并发数受 `/tmp` 体积限制：十几条流同时跑必须把 `PUBMED_DL_PROFILE_BASE` 指向磁盘。
